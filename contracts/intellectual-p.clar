@@ -266,3 +266,131 @@
     (ok true)
   )
 )
+
+
+(define-map dispute-registry
+  { dispute-id: uint, ip-id: uint }
+  {
+    complainant: principal,
+    reason: (string-utf8 500),
+    evidence-hash: (buff 32),
+    status: (string-ascii 20),
+    filed-at: uint,
+    resolved-at: uint,
+    resolution: (string-utf8 500),
+    arbitrator: principal
+  }
+)
+
+(define-data-var dispute-counter uint u1)
+
+(define-map arbitrators
+  { address: principal }
+  { active: bool }
+)
+
+(define-public (register-arbitrator (arbitrator principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set arbitrators
+      { address: arbitrator }
+      { active: true }
+    )
+    (ok true)))
+
+(define-public (file-dispute (ip-id uint) (reason (string-utf8 500)) (evidence-hash (buff 32)))
+  (let
+    ((dispute-id (var-get dispute-counter)))
+    (map-set dispute-registry
+      { dispute-id: dispute-id, ip-id: ip-id }
+      {
+        complainant: tx-sender,
+        reason: reason,
+        evidence-hash: evidence-hash,
+        status: "pending",
+        filed-at: stacks-block-height,
+        resolved-at: u0,
+        resolution: u"",
+        arbitrator: contract-owner
+      }
+    )
+    (var-set dispute-counter (+ dispute-id u1))
+    (ok dispute-id)))
+
+(define-public (resolve-dispute (dispute-id uint) (ip-id uint) (resolution (string-utf8 500)))
+  (let
+    ((dispute (unwrap! (map-get? dispute-registry { dispute-id: dispute-id, ip-id: ip-id }) err-not-found))
+     (is-arbitrator (unwrap! (map-get? arbitrators { address: tx-sender }) err-unauthorized)))
+    (asserts! (get active is-arbitrator) err-unauthorized)
+    (map-set dispute-registry
+      { dispute-id: dispute-id, ip-id: ip-id }
+      (merge dispute {
+        status: "resolved",
+        resolved-at: stacks-block-height,
+        resolution: resolution,
+        arbitrator: tx-sender
+      })
+    )
+    (ok true)))
+
+  
+
+
+(define-map revenue-sharing
+  { ip-id: uint }
+  {
+    total-shares: uint,
+    remaining-shares: uint
+  }
+)
+
+(define-map share-holders
+  { ip-id: uint, holder: principal }
+  {
+    shares: uint,
+    earnings: uint
+  }
+)
+
+(define-public (setup-revenue-sharing (ip-id uint) (total-shares uint))
+  (let
+    ((ip-details (unwrap! (get-ip-details ip-id) err-not-found)))
+    (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
+    (asserts! (>= total-shares u100) err-invalid-input)
+    (map-set revenue-sharing
+      { ip-id: ip-id }
+      {
+        total-shares: total-shares,
+        remaining-shares: total-shares
+      }
+    )
+    (ok true)))
+
+(define-public (allocate-shares (ip-id uint) (recipient principal) (share-amount uint))
+  (let
+    ((ip-details (unwrap! (get-ip-details ip-id) err-not-found))
+     (sharing-info (unwrap! (map-get? revenue-sharing { ip-id: ip-id }) err-not-found)))
+    (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
+    (asserts! (<= share-amount (get remaining-shares sharing-info)) err-invalid-input)
+    (map-set revenue-sharing
+      { ip-id: ip-id }
+      { 
+        total-shares: (get total-shares sharing-info),
+        remaining-shares: (- (get remaining-shares sharing-info) share-amount)
+      }
+    )
+    (map-set share-holders
+      { ip-id: ip-id, holder: recipient }
+      {
+        shares: share-amount,
+        earnings: u0
+      }
+    )
+    (ok true)))
+
+(define-public (distribute-revenue (ip-id uint) (amount uint))
+  (let
+    ((ip-details (unwrap! (get-ip-details ip-id) err-not-found))
+     (sharing-info (unwrap! (map-get? revenue-sharing { ip-id: ip-id }) err-not-found)))
+    (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
+    (ok true)))
