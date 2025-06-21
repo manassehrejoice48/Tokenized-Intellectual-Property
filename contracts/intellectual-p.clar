@@ -394,3 +394,266 @@
      (sharing-info (unwrap! (map-get? revenue-sharing { ip-id: ip-id }) err-not-found)))
     (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
     (ok true)))
+
+
+(define-map marketplace-listings
+  { listing-id: uint }
+  {
+    ip-id: uint,
+    seller: principal,
+    price: uint,
+    listing-type: (string-ascii 20),
+    duration: uint,
+    created-at: uint,
+    expires-at: uint,
+    status: (string-ascii 20),
+    terms: (string-utf8 300)
+  }
+)
+
+(define-map marketplace-offers
+  { listing-id: uint, buyer: principal }
+  {
+    offer-price: uint,
+    offered-at: uint,
+    expires-at: uint,
+    status: (string-ascii 20)
+  }
+)
+
+(define-data-var listing-counter uint u1)
+
+(define-constant err-listing-not-found (err u106))
+(define-constant err-listing-expired (err u107))
+(define-constant err-insufficient-payment (err u108))
+(define-constant err-invalid-listing-type (err u109))
+(define-constant err-cannot-buy-own-listing (err u110))
+
+(define-public (create-marketplace-listing 
+    (ip-id uint) 
+    (price uint) 
+    (listing-type (string-ascii 20))
+    (duration uint)
+    (terms (string-utf8 300)))
+  (let
+    (
+      (listing-id (var-get listing-counter))
+      (ip-details (unwrap! (get-ip-details ip-id) err-not-found))
+      (current-time stacks-block-height)
+      (expiration-time (+ current-time duration))
+    )
+    (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
+    (asserts! (> price u0) err-invalid-input)
+    (asserts! (or (is-eq listing-type "sale") (is-eq listing-type "license")) err-invalid-listing-type)
+    (asserts! (> duration u0) err-invalid-input)
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      {
+        ip-id: ip-id,
+        seller: tx-sender,
+        price: price,
+        listing-type: listing-type,
+        duration: duration,
+        created-at: current-time,
+        expires-at: expiration-time,
+        status: "active",
+        terms: terms
+      }
+    )
+    
+    (var-set listing-counter (+ listing-id u1))
+    (ok listing-id)
+  )
+)
+
+(define-public (make-offer (listing-id uint) (offer-price uint) (offer-duration uint))
+  (let
+    (
+      (listing (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) err-listing-not-found))
+      (current-time stacks-block-height)
+      (offer-expiry (+ current-time offer-duration))
+    )
+    (asserts! (is-eq (get status listing) "active") err-listing-expired)
+    (asserts! (< current-time (get expires-at listing)) err-listing-expired)
+    (asserts! (not (is-eq tx-sender (get seller listing))) err-cannot-buy-own-listing)
+    (asserts! (> offer-price u0) err-invalid-input)
+    
+    (map-set marketplace-offers
+      { listing-id: listing-id, buyer: tx-sender }
+      {
+        offer-price: offer-price,
+        offered-at: current-time,
+        expires-at: offer-expiry,
+        status: "pending"
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (accept-offer (listing-id uint) (buyer principal))
+  (let
+    (
+      (listing (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) err-listing-not-found))
+      (offer (unwrap! (map-get? marketplace-offers { listing-id: listing-id, buyer: buyer }) err-not-found))
+      (ip-details (unwrap! (get-ip-details (get ip-id listing)) err-not-found))
+      (current-time stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get seller listing)) err-unauthorized)
+    (asserts! (is-eq (get status offer) "pending") err-invalid-input)
+    (asserts! (< current-time (get expires-at offer)) err-listing-expired)
+    
+    (if (is-eq (get listing-type listing) "sale")
+      (begin
+        (try! (nft-transfer? intellectual-property (get ip-id listing) tx-sender buyer))
+        (map-set ip-registry
+          { id: (get ip-id listing) }
+          (merge ip-details { creator: buyer })
+        )
+      )
+      (map-set ip-license-grants
+        { ip-id: (get ip-id listing), licensee: buyer }
+        {
+          granted-at: current-time,
+          expires-at: (+ current-time (get duration listing)),
+          terms: (get terms listing),
+          payment: (get offer-price offer)
+        }
+      )
+    )
+    
+    (try! (distribute-marketplace-payment (get ip-id listing) (get offer-price offer)))
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      (merge listing { status: "sold" })
+    )
+    
+    (map-set marketplace-offers
+      { listing-id: listing-id, buyer: buyer }
+      (merge offer { status: "accepted" })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (buy-now (listing-id uint))
+  (let
+    (
+      (listing (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) err-listing-not-found))
+      (ip-details (unwrap! (get-ip-details (get ip-id listing)) err-not-found))
+      (current-time stacks-block-height)
+    )
+    (asserts! (is-eq (get status listing) "active") err-listing-expired)
+    (asserts! (< current-time (get expires-at listing)) err-listing-expired)
+    (asserts! (not (is-eq tx-sender (get seller listing))) err-cannot-buy-own-listing)
+    
+    (if (is-eq (get listing-type listing) "sale")
+      (begin
+        (try! (nft-transfer? intellectual-property (get ip-id listing) (get seller listing) tx-sender))
+        (map-set ip-registry
+          { id: (get ip-id listing) }
+          (merge ip-details { creator: tx-sender })
+        )
+      )
+      (map-set ip-license-grants
+        { ip-id: (get ip-id listing), licensee: tx-sender }
+        {
+          granted-at: current-time,
+          expires-at: (+ current-time (get duration listing)),
+          terms: (get terms listing),
+          payment: (get price listing)
+        }
+      )
+    )
+    
+    (try! (distribute-marketplace-payment (get ip-id listing) (get price listing)))
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      (merge listing { status: "sold" })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-private (distribute-marketplace-payment (ip-id uint) (payment-amount uint))
+  (let
+    (
+      (ip-details (unwrap! (get-ip-details ip-id) err-not-found))
+      (royalty-percent (get royalty-percent ip-details))
+      (royalty-amount (/ (* payment-amount royalty-percent) u100))
+      (seller-amount (- payment-amount royalty-amount))
+    )
+    ;; (if (> royalty-amount u0)
+    ;;   ;; (try! (distribute-royalty-to-shareholders ip-id royalty-amount))
+    ;;   (ok true)
+    ;; )
+    (ok true)
+  )
+)
+
+(define-private (distribute-royalty-to-shareholders (ip-id uint) (royalty-amount uint))
+  (match (map-get? revenue-sharing { ip-id: ip-id })
+    sharing-info 
+      (let
+        (
+          (total-shares (get total-shares sharing-info))
+        )
+        (ok true)
+      )
+    (ok true)
+  )
+)
+
+(define-public (cancel-listing (listing-id uint))
+  (let
+    (
+      (listing (unwrap! (map-get? marketplace-listings { listing-id: listing-id }) err-listing-not-found))
+    )
+    (asserts! (is-eq tx-sender (get seller listing)) err-unauthorized)
+    (asserts! (is-eq (get status listing) "active") err-invalid-input)
+    
+    (map-set marketplace-listings
+      { listing-id: listing-id }
+      (merge listing { status: "cancelled" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (withdraw-offer (listing-id uint))
+  (let
+    (
+      (offer (unwrap! (map-get? marketplace-offers { listing-id: listing-id, buyer: tx-sender }) err-not-found))
+    )
+    (asserts! (is-eq (get status offer) "pending") err-invalid-input)
+    
+    (map-set marketplace-offers
+      { listing-id: listing-id, buyer: tx-sender }
+      (merge offer { status: "withdrawn" })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-marketplace-listing (listing-id uint))
+  (match (map-get? marketplace-listings { listing-id: listing-id })
+    listing (ok listing)
+    err-listing-not-found
+  )
+)
+
+(define-read-only (get-marketplace-offer (listing-id uint) (buyer principal))
+  (match (map-get? marketplace-offers { listing-id: listing-id, buyer: buyer })
+    offer (ok offer)
+    err-not-found
+  )
+)
+
+(define-read-only (get-listing-counter)
+  (ok (var-get listing-counter))
+)
