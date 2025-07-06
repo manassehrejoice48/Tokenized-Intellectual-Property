@@ -656,4 +656,248 @@
 
 (define-read-only (get-listing-counter)
   (ok (var-get listing-counter))
+)(define-map verification-registry
+  { ip-id: uint }
+  {
+    proof-hash: (buff 32),
+    verification-timestamp: uint,
+    verification-method: (string-ascii 50),
+    cryptographic-signature: (buff 65),
+    witness-count: uint,
+    verification-status: (string-ascii 20),
+    metadata-uri: (string-ascii 200)
+  }
+)
+
+(define-map verification-witnesses
+  { ip-id: uint, witness: principal }
+  {
+    witness-signature: (buff 65),
+    witness-timestamp: uint,
+    witness-statement: (string-utf8 200)
+  }
+)
+
+(define-map verification-chain
+  { ip-id: uint, chain-id: uint }
+  {
+    previous-hash: (buff 32),
+    current-hash: (buff 32),
+    timestamp: uint,
+    action: (string-ascii 50),
+    actor: principal
+  }
+)
+
+(define-data-var verification-chain-counter uint u1)
+
+(define-constant err-verification-exists (err u111))
+(define-constant err-verification-failed (err u112))
+(define-constant err-insufficient-witnesses (err u113))
+(define-constant err-invalid-signature (err u114))
+
+(define-public (create-verification-proof 
+    (ip-id uint) 
+    (proof-hash (buff 32))
+    (verification-method (string-ascii 50))
+    (cryptographic-signature (buff 65))
+    (metadata-uri (string-ascii 200)))
+  (let
+    (
+      (ip-details (unwrap! (get-ip-details ip-id) err-not-found))
+      (existing-verification (map-get? verification-registry { ip-id: ip-id }))
+      (verification-chain-id (var-get verification-chain-counter))
+    )
+    (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
+    (asserts! (is-none existing-verification) err-verification-exists)
+    (asserts! (> (len verification-method) u0) err-invalid-input)
+    (asserts! (> (len metadata-uri) u0) err-invalid-input)
+    
+    (map-set verification-registry
+      { ip-id: ip-id }
+      {
+        proof-hash: proof-hash,
+        verification-timestamp: stacks-block-height,
+        verification-method: verification-method,
+        cryptographic-signature: cryptographic-signature,
+        witness-count: u0,
+        verification-status: "pending",
+        metadata-uri: metadata-uri
+      }
+    )
+    
+    (map-set verification-chain
+      { ip-id: ip-id, chain-id: verification-chain-id }
+      {
+        previous-hash: 0x0000000000000000000000000000000000000000000000000000000000000000,
+        current-hash: proof-hash,
+        timestamp: stacks-block-height,
+        action: "verification_created",
+        actor: tx-sender
+      }
+    )
+    
+    (var-set verification-chain-counter (+ verification-chain-id u1))
+    (ok true)
+  )
+)
+
+(define-public (add-verification-witness 
+    (ip-id uint) 
+    (witness-signature (buff 65))
+    (witness-statement (string-utf8 200)))
+  (let
+    (
+      (verification (unwrap! (map-get? verification-registry { ip-id: ip-id }) err-not-found))
+      (existing-witness (map-get? verification-witnesses { ip-id: ip-id, witness: tx-sender }))
+      (verification-chain-id (var-get verification-chain-counter))
+    )
+    (asserts! (is-none existing-witness) err-already-exists)
+    (asserts! (is-eq (get verification-status verification) "pending") err-invalid-input)
+    (asserts! (> (len witness-statement) u0) err-invalid-input)
+    
+    (map-set verification-witnesses
+      { ip-id: ip-id, witness: tx-sender }
+      {
+        witness-signature: witness-signature,
+        witness-timestamp: stacks-block-height,
+        witness-statement: witness-statement
+      }
+    )
+    
+    (let
+      (
+        (new-witness-count (+ (get witness-count verification) u1))
+        (current-hash (hash160 witness-signature))
+      )
+      (map-set verification-registry
+        { ip-id: ip-id }
+        (merge verification { witness-count: new-witness-count })
+      )
+      
+      (map-set verification-chain
+        { ip-id: ip-id, chain-id: verification-chain-id }
+        {
+          previous-hash: (get proof-hash verification),
+          current-hash: current-hash,
+          timestamp: stacks-block-height,
+          action: "witness_added",
+          actor: tx-sender
+        }
+      )
+      
+      (var-set verification-chain-counter (+ verification-chain-id u1))
+      (ok true)
+    )
+  )
+)
+
+(define-public (finalize-verification (ip-id uint))
+  (let
+    (
+      (verification (unwrap! (map-get? verification-registry { ip-id: ip-id }) err-not-found))
+      (ip-details (unwrap! (get-ip-details ip-id) err-not-found))
+      (verification-chain-id (var-get verification-chain-counter))
+    )
+    (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
+    (asserts! (is-eq (get verification-status verification) "pending") err-invalid-input)
+    (asserts! (>= (get witness-count verification) u2) err-insufficient-witnesses)
+    
+    (let
+      (
+        (final-hash (hash160 (get proof-hash verification)))
+      )
+      (map-set verification-registry
+        { ip-id: ip-id }
+        (merge verification { verification-status: "verified" })
+      )
+      
+      (map-set verification-chain
+        { ip-id: ip-id, chain-id: verification-chain-id }
+        {
+          previous-hash: (get proof-hash verification),
+          current-hash: final-hash,
+          timestamp: stacks-block-height,
+          action: "verification_finalized",
+          actor: tx-sender
+        }
+      )
+      
+      (var-set verification-chain-counter (+ verification-chain-id u1))
+      (ok true)
+    )
+  )
+)
+
+(define-public (challenge-verification (ip-id uint) (challenge-evidence (buff 32)) (challenge-reason (string-utf8 300)))
+  (let
+    (
+      (verification (unwrap! (map-get? verification-registry { ip-id: ip-id }) err-not-found))
+      (verification-chain-id (var-get verification-chain-counter))
+    )
+    (asserts! (is-eq (get verification-status verification) "verified") err-invalid-input)
+    (asserts! (> (len challenge-reason) u0) err-invalid-input)
+    
+    (map-set verification-registry
+      { ip-id: ip-id }
+      (merge verification { verification-status: "challenged" })
+    )
+    
+    (map-set verification-chain
+      { ip-id: ip-id, chain-id: verification-chain-id }
+      {
+        previous-hash: (get proof-hash verification),
+        current-hash: challenge-evidence,
+        timestamp: stacks-block-height,
+        action: "verification_challenged",
+        actor: tx-sender
+      }
+    )
+    
+    (var-set verification-chain-counter (+ verification-chain-id u1))
+    (ok true)
+  )
+)
+
+(define-public (validate-verification-chain (ip-id uint) (verification-chain-id uint))
+  (let
+    (
+      (verification (unwrap! (map-get? verification-registry { ip-id: ip-id }) err-not-found))
+      (chain-entry (map-get? verification-chain { ip-id: ip-id, chain-id: verification-chain-id }))
+    )
+    (asserts! (> verification-chain-id u0) err-invalid-input)
+    
+    (ok (is-some chain-entry))
+  )
+)
+
+(define-read-only (get-verification-details (ip-id uint))
+  (match (map-get? verification-registry { ip-id: ip-id })
+    verification (ok verification)
+    err-not-found
+  )
+)
+
+(define-read-only (get-verification-witness (ip-id uint) (witness principal))
+  (match (map-get? verification-witnesses { ip-id: ip-id, witness: witness })
+    witness-data (ok witness-data)
+    err-not-found
+  )
+)
+
+(define-read-only (get-verification-chain-entry (ip-id uint) (verification-chain-id uint))
+  (match (map-get? verification-chain { ip-id: ip-id, chain-id: verification-chain-id })
+    chain-entry (ok chain-entry)
+    err-not-found
+  )
+)
+
+(define-read-only (is-verification-valid (ip-id uint))
+  (match (map-get? verification-registry { ip-id: ip-id })
+    verification 
+      (ok (and 
+        (is-eq (get verification-status verification) "verified")
+        (>= (get witness-count verification) u2)))
+    (ok false)
+  )
 )
