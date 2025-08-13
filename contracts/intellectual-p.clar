@@ -901,3 +901,432 @@
     (ok false)
   )
 )
+
+;; Dynamic Pricing Intelligence Engine
+;; Tracks market performance and adjusts IP pricing based on demand, usage patterns, and creator preferences
+
+(define-map ip-pricing-intelligence
+  { ip-id: uint }
+  {
+    base-price: uint,
+    current-price: uint,
+    price-multiplier: uint, ;; stored as percentage (100 = 1.0x, 150 = 1.5x)
+    min-price: uint,
+    max-price: uint,
+    surge-threshold: uint, ;; number of licenses needed to trigger surge pricing
+    decay-rate: uint, ;; price reduction rate when demand drops (percentage per block)
+    last-price-update: uint,
+    creator-locked: bool, ;; if true, creator has locked pricing parameters
+    pricing-strategy: (string-ascii 20) ;; "demand", "time", "performance", "manual"
+  }
+)
+
+(define-map ip-market-metrics
+  { ip-id: uint }
+  {
+    total-licenses: uint,
+    licenses-last-100-blocks: uint,
+    total-revenue: uint,
+    revenue-last-100-blocks: uint,
+    view-count: uint,
+    engagement-score: uint, ;; calculated based on views, licenses, and interactions
+    peak-demand-price: uint,
+    average-license-price: uint,
+    last-license-timestamp: uint,
+    trending-score: uint ;; algorithm-based trending calculation
+  }
+)
+
+(define-map pricing-history
+  { ip-id: uint, block-height: uint }
+  {
+    price: uint,
+    trigger-reason: (string-ascii 30), ;; "surge", "decay", "manual", "strategy"
+    demand-level: uint, ;; 1-10 scale
+    licenses-in-period: uint
+  }
+)
+
+(define-map global-market-stats
+  { category: (string-ascii 50) }
+  {
+    average-price: uint,
+    total-volume: uint,
+    active-ips: uint,
+    trending-multiplier: uint ;; category-wide pricing influence
+  }
+)
+
+;; New error constants for pricing engine
+(define-constant err-pricing-locked (err u115))
+(define-constant err-invalid-price-range (err u116))
+(define-constant err-invalid-strategy (err u117))
+(define-constant err-price-calculation-failed (err u118))
+
+;; Initialize pricing intelligence for an IP
+(define-public (setup-pricing-intelligence 
+    (ip-id uint) 
+    (base-price uint)
+    (min-price uint)
+    (max-price uint)
+    (surge-threshold uint)
+    (decay-rate uint)
+    (pricing-strategy (string-ascii 20)))
+  (let
+    (
+      (ip-details (unwrap! (get-ip-details ip-id) err-not-found))
+    )
+    ;; Verify IP owner
+    (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
+    ;; Validate price range
+    (asserts! (<= min-price base-price) err-invalid-price-range)
+    (asserts! (<= base-price max-price) err-invalid-price-range)
+    ;; Validate strategy
+    (asserts! (or (is-eq pricing-strategy "demand") 
+                  (or (is-eq pricing-strategy "time") 
+                      (or (is-eq pricing-strategy "performance") 
+                          (is-eq pricing-strategy "manual")))) err-invalid-strategy)
+    
+    ;; Initialize pricing intelligence
+    (map-set ip-pricing-intelligence
+      { ip-id: ip-id }
+      {
+        base-price: base-price,
+        current-price: base-price,
+        price-multiplier: u100, ;; start at 1.0x
+        min-price: min-price,
+        max-price: max-price,
+        surge-threshold: surge-threshold,
+        decay-rate: decay-rate,
+        last-price-update: stacks-block-height,
+        creator-locked: false,
+        pricing-strategy: pricing-strategy
+      }
+    )
+    
+    ;; Initialize market metrics
+    (map-set ip-market-metrics
+      { ip-id: ip-id }
+      {
+        total-licenses: u0,
+        licenses-last-100-blocks: u0,
+        total-revenue: u0,
+        revenue-last-100-blocks: u0,
+        view-count: u0,
+        engagement-score: u0,
+        peak-demand-price: base-price,
+        average-license-price: base-price,
+        last-license-timestamp: u0,
+        trending-score: u0
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+;; Record IP interaction (view, license attempt, etc.)
+(define-public (record-ip-interaction (ip-id uint) (interaction-type (string-ascii 20)) (value uint))
+  (let
+    (
+      (existing-metrics (unwrap! (map-get? ip-market-metrics { ip-id: ip-id }) err-not-found))
+      (current-time stacks-block-height)
+    )
+    ;; Update metrics based on interaction type
+    (if (is-eq interaction-type "view")
+      ;; Handle view interaction
+      (begin
+        (map-set ip-market-metrics
+          { ip-id: ip-id }
+          (merge existing-metrics { 
+            view-count: (+ (get view-count existing-metrics) u1),
+            engagement-score: (calculate-engagement-score ip-id (+ (get view-count existing-metrics) u1) (get total-licenses existing-metrics))
+          })
+        )
+        (ok true)
+      )
+      ;; Handle license interaction
+      (if (is-eq interaction-type "license")
+        (let
+          (
+            (new-total-licenses (+ (get total-licenses existing-metrics) u1))
+            (new-total-revenue (+ (get total-revenue existing-metrics) value))
+            (recent-licenses (count-recent-licenses ip-id current-time))
+          )
+          (map-set ip-market-metrics
+            { ip-id: ip-id }
+            (merge existing-metrics {
+              total-licenses: new-total-licenses,
+              licenses-last-100-blocks: recent-licenses,
+              total-revenue: new-total-revenue,
+              revenue-last-100-blocks: (calculate-recent-revenue ip-id current-time),
+              last-license-timestamp: current-time,
+              average-license-price: (/ new-total-revenue new-total-licenses),
+              engagement-score: (calculate-engagement-score ip-id (get view-count existing-metrics) new-total-licenses)
+            })
+          )
+          ;; Trigger price recalculation for demand-based pricing
+          (update-dynamic-pricing ip-id)
+        )
+        (ok true) ;; Unknown interaction type, ignore
+      )
+    )
+  )
+)
+
+;; Calculate dynamic pricing based on current market conditions
+(define-public (update-dynamic-pricing (ip-id uint))
+  (let
+    (
+      (pricing-intel (unwrap! (map-get? ip-pricing-intelligence { ip-id: ip-id }) err-not-found))
+      (market-metrics (unwrap! (map-get? ip-market-metrics { ip-id: ip-id }) err-not-found))
+      (current-time stacks-block-height)
+      (blocks-since-update (- current-time (get last-price-update pricing-intel)))
+    )
+    ;; Skip if pricing is manually locked by creator
+    (asserts! (not (get creator-locked pricing-intel)) err-pricing-locked)
+    
+    ;; Calculate new price based on strategy
+    (let
+      (
+        (new-price (if (is-eq (get pricing-strategy pricing-intel) "demand")
+                     (calculate-demand-price ip-id pricing-intel market-metrics)
+                     (if (is-eq (get pricing-strategy pricing-intel) "performance")
+                       (calculate-performance-price ip-id pricing-intel market-metrics)
+                       (if (is-eq (get pricing-strategy pricing-intel) "time")
+                         (calculate-time-based-price ip-id pricing-intel blocks-since-update)
+                         (get current-price pricing-intel) ;; manual strategy, no auto-update
+                       )
+                     )
+                   ))
+        (clamped-price (clamp-price new-price pricing-intel))
+        (new-multiplier (/ (* clamped-price u100) (get base-price pricing-intel)))
+      )
+      ;; Update pricing intelligence
+      (map-set ip-pricing-intelligence
+        { ip-id: ip-id }
+        (merge pricing-intel {
+          current-price: clamped-price,
+          price-multiplier: new-multiplier,
+          last-price-update: current-time
+        })
+      )
+      
+      ;; Record price change in history
+      (map-set pricing-history
+        { ip-id: ip-id, block-height: current-time }
+        {
+          price: clamped-price,
+          trigger-reason: (get pricing-strategy pricing-intel),
+          demand-level: (calculate-demand-level market-metrics),
+          licenses-in-period: (get licenses-last-100-blocks market-metrics)
+        }
+      )
+      
+      ;; Update peak price if necessary
+      (if (> clamped-price (get peak-demand-price market-metrics))
+        (begin
+          (map-set ip-market-metrics
+            { ip-id: ip-id }
+            (merge market-metrics { peak-demand-price: clamped-price })
+          )
+          (ok true)
+        )
+        (ok true)
+      )
+    )
+  )
+)
+
+;; Calculate demand-based pricing using surge and decay algorithms
+(define-private (calculate-demand-price (ip-id uint) (pricing-intel (tuple (base-price uint) (current-price uint) (price-multiplier uint) (min-price uint) (max-price uint) (surge-threshold uint) (decay-rate uint) (last-price-update uint) (creator-locked bool) (pricing-strategy (string-ascii 20)))) (metrics (tuple (total-licenses uint) (licenses-last-100-blocks uint) (total-revenue uint) (revenue-last-100-blocks uint) (view-count uint) (engagement-score uint) (peak-demand-price uint) (average-license-price uint) (last-license-timestamp uint) (trending-score uint))))
+  (let
+    (
+      (recent-licenses (get licenses-last-100-blocks metrics))
+      (surge-threshold (get surge-threshold pricing-intel))
+      (current-price (get current-price pricing-intel))
+      (base-price (get base-price pricing-intel))
+    )
+    ;; Apply surge pricing if recent demand exceeds threshold
+    (if (>= recent-licenses surge-threshold)
+      ;; Surge pricing: increase by 25% for every threshold exceeded
+      (let
+        (
+          (surge-multiplier (+ u100 (* u25 (/ recent-licenses surge-threshold))))
+        )
+        (/ (* base-price surge-multiplier) u100)
+      )
+      ;; Decay pricing: gradually reduce price when demand is low
+      (if (is-eq recent-licenses u0)
+        (let
+          (
+            (decay-amount (/ (* current-price (get decay-rate pricing-intel)) u100))
+          )
+          (if (> current-price (+ base-price decay-amount))
+            (- current-price decay-amount)
+            base-price ;; Don't go below base price
+          )
+        )
+        current-price ;; Maintain current price for moderate demand
+      )
+    )
+  )
+)
+
+;; Calculate performance-based pricing using engagement and revenue metrics
+(define-private (calculate-performance-price (ip-id uint) (pricing-intel (tuple (base-price uint) (current-price uint) (price-multiplier uint) (min-price uint) (max-price uint) (surge-threshold uint) (decay-rate uint) (last-price-update uint) (creator-locked bool) (pricing-strategy (string-ascii 20)))) (metrics (tuple (total-licenses uint) (licenses-last-100-blocks uint) (total-revenue uint) (revenue-last-100-blocks uint) (view-count uint) (engagement-score uint) (peak-demand-price uint) (average-license-price uint) (last-license-timestamp uint) (trending-score uint))))
+  (let
+    (
+      (engagement-score (get engagement-score metrics))
+      (base-price (get base-price pricing-intel))
+      (performance-multiplier (if (> engagement-score u50)
+                               (+ u100 (* (- engagement-score u50) u2)) ;; +2% per point above 50
+                               (if (< engagement-score u25)
+                                 (- u100 (* (- u25 engagement-score) u1)) ;; -1% per point below 25
+                                 u100 ;; neutral performance, maintain base price
+                               )
+                             ))
+    )
+    (/ (* base-price performance-multiplier) u100)
+  )
+)
+
+;; Calculate time-based pricing with gradual decay
+(define-private (calculate-time-based-price (ip-id uint) (pricing-intel (tuple (base-price uint) (current-price uint) (price-multiplier uint) (min-price uint) (max-price uint) (surge-threshold uint) (decay-rate uint) (last-price-update uint) (creator-locked bool) (pricing-strategy (string-ascii 20)))) (blocks-elapsed uint))
+  (let
+    (
+      (current-price (get current-price pricing-intel))
+      (decay-rate (get decay-rate pricing-intel))
+      (base-price (get base-price pricing-intel))
+      ;; Apply time decay every 100 blocks
+      (decay-periods (/ blocks-elapsed u100))
+      (total-decay (/ (* current-price (* decay-rate decay-periods)) u100))
+    )
+    (if (> current-price (+ base-price total-decay))
+      (- current-price total-decay)
+      base-price
+    )
+  )
+)
+
+;; Utility function to clamp price within min/max bounds
+(define-private (clamp-price (price uint) (pricing-intel (tuple (base-price uint) (current-price uint) (price-multiplier uint) (min-price uint) (max-price uint) (surge-threshold uint) (decay-rate uint) (last-price-update uint) (creator-locked bool) (pricing-strategy (string-ascii 20)))))
+  (let
+    (
+      (min-price (get min-price pricing-intel))
+      (max-price (get max-price pricing-intel))
+    )
+    (if (< price min-price)
+      min-price
+      (if (> price max-price)
+        max-price
+        price
+      )
+    )
+  )
+)
+
+;; Calculate engagement score based on views and licenses
+(define-private (calculate-engagement-score (ip-id uint) (views uint) (licenses uint))
+  (if (is-eq views u0)
+    u0
+    (let
+      (
+        (conversion-rate (/ (* licenses u100) views)) ;; percentage of views that convert to licenses
+        (base-score (* conversion-rate u10)) ;; scale up the score
+      )
+      (if (> base-score u100) u100 base-score) ;; cap at 100
+    )
+  )
+)
+
+;; Calculate demand level (1-10 scale) for historical tracking
+(define-private (calculate-demand-level (metrics (tuple (total-licenses uint) (licenses-last-100-blocks uint) (total-revenue uint) (revenue-last-100-blocks uint) (view-count uint) (engagement-score uint) (peak-demand-price uint) (average-license-price uint) (last-license-timestamp uint) (trending-score uint))))
+  (let
+    (
+      (recent-licenses (get licenses-last-100-blocks metrics))
+    )
+    (if (>= recent-licenses u20) u10      ;; Very high demand
+      (if (>= recent-licenses u15) u9
+        (if (>= recent-licenses u10) u8
+          (if (>= recent-licenses u7) u7
+            (if (>= recent-licenses u5) u6
+              (if (>= recent-licenses u3) u5
+                (if (>= recent-licenses u2) u4
+                  (if (>= recent-licenses u1) u3
+                    (if (> (get view-count metrics) u10) u2
+                      u1 ;; Low demand
+                    )
+                  )
+                )
+              )
+            )
+          )
+        )
+      )
+    )
+  )
+)
+
+;; Count recent licenses in the last 100 blocks (simplified for demo)
+(define-private (count-recent-licenses (ip-id uint) (current-time uint))
+  ;; In a real implementation, this would iterate through recent transactions
+  ;; For this demo, we'll use the stored value and increment
+  (match (map-get? ip-market-metrics { ip-id: ip-id })
+    metrics (+ (get licenses-last-100-blocks metrics) u1)
+    u1
+  )
+)
+
+;; Calculate recent revenue (simplified for demo)
+(define-private (calculate-recent-revenue (ip-id uint) (current-time uint))
+  ;; Similar to count-recent-licenses, this would calculate actual recent revenue
+  (match (map-get? ip-market-metrics { ip-id: ip-id })
+    metrics (get revenue-last-100-blocks metrics)
+    u0
+  )
+)
+
+;; Allow creators to lock/unlock automatic pricing
+(define-public (toggle-pricing-lock (ip-id uint))
+  (let
+    (
+      (ip-details (unwrap! (get-ip-details ip-id) err-not-found))
+      (pricing-intel (unwrap! (map-get? ip-pricing-intelligence { ip-id: ip-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator ip-details)) err-unauthorized)
+    
+    (map-set ip-pricing-intelligence
+      { ip-id: ip-id }
+      (merge pricing-intel { creator-locked: (not (get creator-locked pricing-intel)) })
+    )
+    (ok true)
+  )
+)
+
+;; Get current dynamic pricing information
+(define-read-only (get-pricing-intelligence (ip-id uint))
+  (match (map-get? ip-pricing-intelligence { ip-id: ip-id })
+    pricing-intel (ok pricing-intel)
+    err-not-found
+  )
+)
+
+;; Get market performance metrics
+(define-read-only (get-market-metrics (ip-id uint))
+  (match (map-get? ip-market-metrics { ip-id: ip-id })
+    metrics (ok metrics)
+    err-not-found
+  )
+)
+
+;; Get pricing history for a specific block
+(define-read-only (get-pricing-history (ip-id uint) (target-block uint))
+  (match (map-get? pricing-history { ip-id: ip-id, block-height: target-block })
+    history (ok history)
+    err-not-found
+  )
+)
+
+
+
