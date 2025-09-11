@@ -9,6 +9,10 @@ requirements = []
 path = 'contracts/intellectual-p.clar'
 clarity_version = 3
 epoch = 3.1
+[contracts.ip-attribution-engine]
+path = 'contracts/ip-attribution-engine.clar'
+clarity_version = 3
+epoch = 3.1
 [repl.analysis]
 passes = ['check_checker']
 
